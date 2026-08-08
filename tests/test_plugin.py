@@ -32,6 +32,16 @@ class _Star:
     def __init__(self, context):
         self.context = context
 
+    async def html_render(self, *_args, **_kwargs):
+        return "https://example.test/monthly-report.jpg"
+
+
+class _File:
+    def __init__(self, name, file="", url=""):
+        self.name = name
+        self.file = file
+        self.url = url
+
 
 def _load_plugin_module():
     astrbot = types.ModuleType("astrbot")
@@ -41,6 +51,8 @@ def _load_plugin_module():
     api_event = types.ModuleType("astrbot.api.event")
     api_event.AstrMessageEvent = object
     api_event.filter = _Filter
+    api_components = types.ModuleType("astrbot.api.message_components")
+    api_components.File = _File
     api_star = types.ModuleType("astrbot.api.star")
     api_star.Context = object
     api_star.Star = _Star
@@ -53,6 +65,7 @@ def _load_plugin_module():
         "astrbot": astrbot,
         "astrbot.api": api,
         "astrbot.api.event": api_event,
+        "astrbot.api.message_components": api_components,
         "astrbot.api.star": api_star,
         "astrbot.core": core,
         "astrbot.core.utils": utils,
@@ -100,11 +113,20 @@ class _Event:
     def get_sender_id(self):
         return "alice"
 
+    def get_platform_name(self):
+        return "aiocqhttp"
+
     def stop_event(self):
         self.stopped = True
 
     def plain_result(self, text):
         return text
+
+    def image_result(self, image):
+        return ("image", image)
+
+    def chain_result(self, chain):
+        return ("chain", chain)
 
 
 async def _collect(generator):
@@ -114,6 +136,7 @@ async def _collect(generator):
 class PluginTests(unittest.TestCase):
     def _plugin(self, directory, decision=None):
         plugin = PLUGIN.FinancePlugin(_Context(decision), {"auto_analyze": True})
+        plugin.data_dir = Path(directory)
         plugin.ledger = PLUGIN.LedgerStore(Path(directory) / "ledger.json")
         return plugin
 
@@ -204,6 +227,69 @@ class PluginTests(unittest.TestCase):
             self.assertIn("八月账目", replies[0])
             self.assertNotIn("七月账目", replies[0])
             self.assertIn("支出合计：¥8.00", replies[0])
+
+    def test_llonebot_month_image_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            plugin.ledger.add_many(
+                "test-bot:alice",
+                [
+                    PLUGIN.make_transaction(
+                        kind="expense",
+                        amount="28.50",
+                        note="午饭",
+                        timestamp="2026-08-08 12:00",
+                    )
+                ],
+            )
+            event = _Event("/导出账单 2026-08 图片")
+            replies = asyncio.run(_collect(plugin.export_month(event)))
+
+            self.assertTrue(event.stopped)
+            self.assertIn("支出：1 笔，共 ¥28.50", replies[0])
+            self.assertEqual(replies[1][0], "image")
+
+    def test_llonebot_month_csv_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            event = _Event("/导出账单 2026-08 文件")
+            replies = asyncio.run(_collect(plugin.export_month(event)))
+
+            self.assertEqual(replies[1][0], "chain")
+            file_component = replies[1][1][0]
+            self.assertTrue(Path(file_component.file).exists())
+            self.assertEqual(file_component.name, "finance_2026-08.csv")
+
+    def test_llm_can_request_month_export(self):
+        decision = {
+            "should_record": False,
+            "should_list": False,
+            "should_export": True,
+            "transactions": [],
+            "period": {},
+            "export": {"month": "2026-08", "format": "image"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._plugin(directory, decision)
+            event = _Event("把八月账单按周导出成图片")
+            replies = asyncio.run(_collect(plugin.analyze_message(event)))
+
+            self.assertTrue(event.stopped)
+            self.assertIn("2026-08 月度收支摘要", replies[0])
+            self.assertEqual(replies[1][0], "image")
+
+    def test_image_failure_falls_back_to_csv(self):
+        async def fail_render(*_args, **_kwargs):
+            raise RuntimeError("renderer unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            plugin.html_render = fail_render
+            event = _Event("/导出账单 2026-08 图片")
+            replies = asyncio.run(_collect(plugin.export_month(event)))
+
+            self.assertIn("已自动改为 CSV 文件", replies[0])
+            self.assertEqual(replies[1][0], "chain")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 name: astrbot_plugin_finance
 display_name: 智能记账
-desc: 使用 LLM 识别记账与账单查询意图，记录收入、支出、时间和备注并自动统计总额。
-short_desc: 自然语言智能记账与收支统计。
-version: v1.0.0
+desc: 使用 LLM 识别记账与账单查询意图，支持通过 LLOneBot 按周导出月度收支图片或 CSV。
+short_desc: 自然语言智能记账、收支统计与 QQ 月度导出。
+version: v1.1.0
 author: 失氧化磷四
 repo: https://github.com/syhls/astrbot_plugin_finance.git
 astrbot_version: ">=4.5.7,<5"

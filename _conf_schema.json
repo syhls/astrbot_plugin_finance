@@ -17,6 +17,13 @@
     "type": "int",
     "default": 30
   },
+  "default_export_format": {
+    "description": "LLOneBot 月度账单的默认导出格式",
+    "type": "string",
+    "default": "图片",
+    "options": ["图片", "文件"],
+    "hint": "图片适合直接在 QQ 查看；文件为带 UTF-8 BOM 的 CSV。"
+  },
   "max_analyze_length": {
     "description": "自动分析消息的最大字符数",
     "type": "int",
