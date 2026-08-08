@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
 VALID_KINDS = {"income", "expense"}
+MAX_DELETION_BATCHES = 20
 
 
 class LedgerError(ValueError):
@@ -42,6 +43,37 @@ class Transaction:
             note=value.get("note", ""),
             timestamp=value.get("timestamp", ""),
             transaction_id=value.get("id", ""),
+        )
+
+
+@dataclass(frozen=True)
+class DeletionBatch:
+    id: str
+    deleted_at: str
+    scope: str
+    records: tuple[Transaction, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "deleted_at": self.deleted_at,
+            "scope": self.scope,
+            "records": [item.to_dict() for item in self.records],
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "DeletionBatch":
+        raw_records = value.get("records", [])
+        if not isinstance(raw_records, list):
+            raise LedgerError("撤销记录结构无效")
+        if any(not isinstance(item, dict) for item in raw_records):
+            raise LedgerError("撤销记录结构无效")
+        records = tuple(Transaction.from_dict(item) for item in raw_records)
+        return cls(
+            id=str(value.get("id", "")),
+            deleted_at=str(value.get("deleted_at", "")),
+            scope=str(value.get("scope", "")),
+            records=records,
         )
 
 
@@ -131,6 +163,33 @@ def parse_manual_record(payload: str) -> Transaction:
     )
 
 
+def parse_removal_scope(
+    payload: str, now: datetime
+) -> tuple[str, datetime | None, datetime | None, bool]:
+    """解析批量撤销范围，返回范围名、起止时间及是否要求确认。"""
+    tokens = payload.strip().split()
+    confirmed = "确认" in tokens
+    scope_text = "".join(token for token in tokens if token != "确认")
+    if scope_text in {"", "最后", "最后一笔", "上一笔"}:
+        return "最后一笔", None, None, False
+    if scope_text in {"当天", "今天", "今日"}:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return "当天", start, start + timedelta(days=1), False
+    if scope_text in {"当周", "本周", "这周"}:
+        start = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return "当周", start, start + timedelta(days=7), False
+    if scope_text in {"当月", "本月", "这个月"}:
+        start, end = _month_bounds(now)
+        return "当月", start, end, False
+    if scope_text in {"全部", "所有", "all"}:
+        return "全部", None, None, confirmed
+    raise LedgerError(
+        "范围应为最后一笔、当天、当周、当月或全部；撤销全部需追加“确认”"
+    )
+
+
 def _month_bounds(now: datetime) -> tuple[datetime, datetime]:
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if start.month == 12:
@@ -186,13 +245,17 @@ class LedgerStore:
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"version": 1, "accounts": {}}
+            return {"version": 2, "accounts": {}, "trash": {}}
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise LedgerError("账本文件损坏或无法读取") from exc
         if not isinstance(value, dict) or not isinstance(value.get("accounts"), dict):
             raise LedgerError("账本文件结构无效")
+        trash = value.setdefault("trash", {})
+        if not isinstance(trash, dict):
+            raise LedgerError("撤销记录结构无效")
+        value["version"] = 2
         return value
 
     def _save(self, value: dict[str, Any]) -> None:
@@ -242,6 +305,33 @@ class LedgerStore:
         records.sort(key=lambda item: (item.timestamp, item.id))
         return records
 
+    @staticmethod
+    def _append_deletion_batch(
+        data: dict[str, Any],
+        account_id: str,
+        records: list[Transaction],
+        scope: str,
+    ) -> DeletionBatch:
+        batch = DeletionBatch(
+            id=uuid.uuid4().hex,
+            deleted_at=datetime.now()
+            .astimezone()
+            .replace(tzinfo=None)
+            .strftime(TIMESTAMP_FORMAT),
+            scope=scope,
+            records=tuple(records),
+        )
+        trash = data.setdefault("trash", {})
+        if not isinstance(trash, dict):
+            raise LedgerError("撤销记录结构无效")
+        batches = trash.setdefault(account_id, [])
+        if not isinstance(batches, list):
+            raise LedgerError("用户撤销记录结构无效")
+        batches.append(batch.to_dict())
+        if len(batches) > MAX_DELETION_BATCHES:
+            del batches[:-MAX_DELETION_BATCHES]
+        return batch
+
     def remove_last(self, account_id: str) -> Transaction | None:
         data = self._load()
         raw_records = data["accounts"].get(account_id, [])
@@ -253,5 +343,73 @@ class LedgerStore:
         if not isinstance(raw, dict):
             raise LedgerError("账目记录结构无效")
         removed = Transaction.from_dict(raw)
+        self._append_deletion_batch(data, account_id, [removed], "最后一笔")
         self._save(data)
         return removed
+
+    def remove_range(
+        self,
+        account_id: str,
+        *,
+        start: datetime | None,
+        end: datetime | None,
+        scope: str,
+    ) -> DeletionBatch | None:
+        """撤销范围内记录，并保留最近的撤销批次用于恢复。"""
+        data = self._load()
+        raw_records = data["accounts"].get(account_id, [])
+        if not isinstance(raw_records, list):
+            raise LedgerError("用户账本结构无效")
+        kept: list[dict[str, Any]] = []
+        removed: list[Transaction] = []
+        for raw in raw_records:
+            if not isinstance(raw, dict):
+                raise LedgerError("账目记录结构无效")
+            item = Transaction.from_dict(raw)
+            timestamp = parse_timestamp(item.timestamp)
+            in_range = (start is None or timestamp >= start) and (
+                end is None or timestamp < end
+            )
+            if in_range:
+                removed.append(item)
+            else:
+                kept.append(raw)
+        if not removed:
+            return None
+        data["accounts"][account_id] = kept
+        batch = self._append_deletion_batch(data, account_id, removed, scope)
+        self._save(data)
+        return batch
+
+    def restore_last_batch(self, account_id: str) -> DeletionBatch | None:
+        """恢复当前用户最近一次撤销的记录。"""
+        data = self._load()
+        trash = data.get("trash", {})
+        if not isinstance(trash, dict):
+            raise LedgerError("撤销记录结构无效")
+        batches = trash.get(account_id, [])
+        if not isinstance(batches, list):
+            raise LedgerError("用户撤销记录结构无效")
+        if not batches:
+            return None
+        raw_batch = batches[-1]
+        if not isinstance(raw_batch, dict):
+            raise LedgerError("撤销批次结构无效")
+        batch = DeletionBatch.from_dict(raw_batch)
+        active = data["accounts"].setdefault(account_id, [])
+        if not isinstance(active, list):
+            raise LedgerError("用户账本结构无效")
+        active_ids = {
+            str(item.get("id", "")) for item in active if isinstance(item, dict)
+        }
+        restored = tuple(item for item in batch.records if item.id not in active_ids)
+        active.extend(item.to_dict() for item in restored)
+        batches.pop()
+        restored_batch = DeletionBatch(
+            id=batch.id,
+            deleted_at=batch.deleted_at,
+            scope=batch.scope,
+            records=restored,
+        )
+        self._save(data)
+        return restored_batch

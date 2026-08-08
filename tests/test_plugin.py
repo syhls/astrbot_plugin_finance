@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -290,6 +291,58 @@ class PluginTests(unittest.TestCase):
 
             self.assertIn("已自动改为 CSV 文件", replies[0])
             self.assertEqual(replies[1][0], "chain")
+
+    def test_remove_today_and_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            now = datetime.now().astimezone().replace(tzinfo=None)
+            plugin.ledger.add_many(
+                "test-bot:alice",
+                [
+                    PLUGIN.make_transaction(
+                        kind="expense",
+                        amount="12",
+                        note="今天消费",
+                        timestamp=now.strftime("%Y-%m-%d %H:%M"),
+                    )
+                ],
+            )
+            remove_event = _Event("/撤销记账 当天")
+            remove_replies = asyncio.run(
+                _collect(plugin.undo_record(remove_event))
+            )
+
+            self.assertIn("已撤销当天记录 1 笔", remove_replies[0])
+            self.assertEqual(plugin.ledger.list_records("test-bot:alice"), [])
+
+            restore_event = _Event("/恢复撤销")
+            restore_replies = asyncio.run(
+                _collect(plugin.restore_records(restore_event))
+            )
+            self.assertIn("已恢复当天记录 1 笔", restore_replies[0])
+            self.assertEqual(len(plugin.ledger.list_records("test-bot:alice")), 1)
+
+    def test_remove_all_requires_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            plugin.ledger.add_many(
+                "test-bot:alice",
+                [PLUGIN.make_transaction(kind="income", amount="100", note="存入")],
+            )
+            warning_event = _Event("/撤销记账 全部")
+            warning_replies = asyncio.run(
+                _collect(plugin.undo_record(warning_event))
+            )
+
+            self.assertIn("全部账目", warning_replies[0])
+            self.assertEqual(len(plugin.ledger.list_records("test-bot:alice")), 1)
+
+            confirm_event = _Event("/撤销记账 全部 确认")
+            confirm_replies = asyncio.run(
+                _collect(plugin.undo_record(confirm_event))
+            )
+            self.assertIn("已撤销全部记录 1 笔", confirm_replies[0])
+            self.assertEqual(plugin.ledger.list_records("test-bot:alice"), [])
 
 
 if __name__ == "__main__":

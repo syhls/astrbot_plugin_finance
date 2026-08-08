@@ -23,6 +23,7 @@ from .ledger import (
     make_transaction,
     parse_manual_record,
     parse_period,
+    parse_removal_scope,
 )
 from .report import (
     MONTHLY_REPORT_HTML,
@@ -317,20 +318,61 @@ class FinancePlugin(Star):
 
     @filter.command("撤销记账", alias={"finance_undo"}, priority=1)
     async def undo_record(self, event: AstrMessageEvent):
-        """撤销自己的最后一笔账目。"""
+        """撤销最后一笔、当天、当周、当月或全部个人账目。"""
+        payload = self._command_payload(event.message_str)
         try:
+            scope, start, end, all_confirmed = parse_removal_scope(
+                payload, datetime.now().astimezone().replace(tzinfo=None)
+            )
+            if scope == "全部" and not all_confirmed:
+                event.stop_event()
+                yield event.plain_result(
+                    "⚠️ 该操作会撤销你的全部账目。\n"
+                    "如确认，请发送：/撤销记账 全部 确认"
+                )
+                return
             async with self._ledger_lock:
-                removed = self.ledger.remove_last(self._account_id(event))
-            if removed is None:
+                if scope == "最后一笔":
+                    item = self.ledger.remove_last(self._account_id(event))
+                    removed = [item] if item else []
+                else:
+                    batch = self.ledger.remove_range(
+                        self._account_id(event),
+                        start=start,
+                        end=end,
+                        scope=scope,
+                    )
+                    removed = list(batch.records) if batch else []
+            if not removed:
                 result = "没有可撤销的账目。"
             else:
-                kind = "收入" if removed.kind == "income" else "支出"
+                income_items = [item for item in removed if item.kind == "income"]
+                expense_items = [item for item in removed if item.kind == "expense"]
+                income = sum((item.amount for item in income_items), Decimal("0"))
+                expense = sum((item.amount for item in expense_items), Decimal("0"))
                 result = (
-                    f"↩️ 已撤销：{removed.timestamp}｜{kind} "
-                    f"¥{self._money(removed.amount)}｜{removed.note}"
+                    f"↩️ 已撤销{scope}记录 {len(removed)} 笔\n"
+                    f"收入：{len(income_items)} 笔，¥{self._money(income)}\n"
+                    f"支出：{len(expense_items)} 笔，¥{self._money(expense)}\n"
+                    "可发送 /恢复撤销 恢复本次记录。"
                 )
         except LedgerError as exc:
             result = f"撤销失败：{exc}"
+        event.stop_event()
+        yield event.plain_result(result)
+
+    @filter.command("恢复撤销", alias={"finance_restore"}, priority=1)
+    async def restore_records(self, event: AstrMessageEvent):
+        """恢复当前用户最近一次撤销的账目批次。"""
+        try:
+            async with self._ledger_lock:
+                batch = self.ledger.restore_last_batch(self._account_id(event))
+            if batch is None:
+                result = "没有可恢复的撤销记录。"
+            else:
+                result = f"✅ 已恢复{batch.scope}记录 {len(batch.records)} 笔。"
+        except LedgerError as exc:
+            result = f"恢复失败：{exc}"
         event.stop_event()
         yield event.plain_result(result)
 
@@ -347,7 +389,9 @@ class FinancePlugin(Star):
             "• /账单 [今天|本月|今年|全部|YYYY-MM]\n"
             "• /总额 [范围]\n"
             "• /导出账单 [YYYY-MM] [图片|文件]\n"
-            "• /撤销记账"
+            "• /撤销记账 [当天|当周|当月]\n"
+            "• /撤销记账 全部 确认\n"
+            "• /恢复撤销"
         )
 
     async def _analyze_intent(
