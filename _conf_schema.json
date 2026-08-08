@@ -1,0 +1,25 @@
+{
+  "auto_analyze": {
+    "description": "使用 LLM 自动判断普通消息是否需要记账或输出账单",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仍可使用 /记账、/账单、/总额 等指令。开启会对普通文本调用一次当前会话模型。"
+  },
+  "llm_provider": {
+    "description": "用于记账意图分析的模型提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空时使用当前会话选择的聊天模型。"
+  },
+  "display_limit": {
+    "description": "账单目录单次最多显示的记录数",
+    "type": "int",
+    "default": 30
+  },
+  "max_analyze_length": {
+    "description": "自动分析消息的最大字符数",
+    "type": "int",
+    "default": 500
+  }
+}
